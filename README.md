@@ -1,0 +1,190 @@
+# carefulcopy
+
+Reliable file copying for flaky storage: **atomic**, **resumable**, with **retries**,
+**destination locks** and pluggable **backends** (local today, SMB next).
+
+> Status: early development (0.1.0.dev). The copy engine, local backend,
+> bandwidth throttling and the SMB backend are written and tested. **The SMB
+> backend has only been tested against an in-memory fake, not a real server** -
+> see "Testing against a real server" below before relying on it. Directory
+> trees are still to come.
+
+## Why
+
+`shutil.copyfile` leaves a truncated file behind if the connection drops, and
+starts from zero on retry. carefulcopy:
+
+* writes to `<name>.part.<size>-<mtime>` and renames only when complete and verified;
+* **resumes** from the last byte written after a transient error (reset, timeout, ...);
+* detects a **source modified during the copy** and refuses to produce a mixed file;
+* takes an exclusive **lock** on the destination so two writers cannot collide, and
+  cleans up stale `.part` files of older source versions;
+* supports clean **abort** (`threading.Event`, bool, callable) at block granularity;
+* can **throttle** bandwidth - a fixed cap or an adaptive limit that learns the link speed;
+* has a tiny **Backend** interface, so the same engine works on any storage.
+
+## Usage
+
+```python
+import threading
+from carefulcopy import copy_file, CopyOptions
+
+stop = threading.Event()
+
+ok = copy_file(
+    "/data/big.iso", "/backup/big.iso",
+    progress=lambda src, done, total: print(f"{done}/{total}"),
+    abort=stop,
+    options=CopyOptions(block_size=4 * 1024 * 1024, retries=5),
+)
+# ok is False if `stop` fired; errors raise CopyError / OSError subclasses
+```
+
+Locations are plain paths or URIs such as `smb://host/share/dir/file`. URI
+paths are used verbatim; there is no percent-decoding.
+
+## Bandwidth throttling
+
+Create one throttle and share it between all copies (and threads) that should
+compete for the same bandwidth:
+
+```python
+from carefulcopy import copy_file, AdaptiveThrottle, FixedRateThrottle
+
+throttle = AdaptiveThrottle()                 # use ~85 % of what the link can do
+# throttle = FixedRateThrottle(20 * 1024**2)  # or: never exceed 20 MiB/s
+
+copy_file("/data/a.iso", "smb://nas/share/a.iso", throttle=throttle)  # any thread
+
+throttle.speeds()        # Speeds(download=..., upload=...) in bytes/s, for a UI
+```
+
+`AdaptiveThrottle` starts unlimited ("learning"), measures pure network time
+every `CopyOptions.feedback_after` bytes, estimates the channel capacity,
+smooths it over the last 8 estimates and caps the channel at `headroom` (85 %)
+of that. Transfers between the same two endpoints share one token bucket.
+Measurements older than 60 s are discarded and the channel goes back to
+learning. Local-to-local copies are never throttled by it.
+
+Notes: with several parallel transfers the estimate is an approximation (each
+worker's measured speed is scaled by the number of workers), so the effective
+headroom can differ somewhat from the nominal one. Samples are only taken
+every 8 MiB by default, so many tiny files rely on what was learned earlier.
+Pass `max_rate=` for a hard ceiling on top of the adaptive limit.
+
+## SMB
+
+```
+pip install 'carefulcopy[smb]'          # pulls in smbprotocol; add [keyring] for the OS keychain
+```
+
+```python
+from carefulcopy import (copy_file, configure_smb, ChainCredentials, KeyringCredentials,
+                         PromptCredentials, BatchedFailurePrompt)
+
+# Optional - without it, credentials come from CAREFULCOPY_SMB_USERNAME/_PASSWORD
+# or from ambient auth (e.g. Kerberos):
+backend = configure_smb(
+    ChainCredentials(KeyringCredentials(fallback=PromptCredentials("alice"))),
+    pool_size=8,
+)
+
+copy_file("/data/a.iso", "smb://nas.local/Foto/backup/a.iso")
+copy_file("smb://nas.local/Foto/backup/a.iso", "/tmp/a.iso")
+```
+
+* **Connections** are pooled (lazy, LIFO, closed after 30 s idle). Each copy attempt
+  uses exactly one connection for lock, `.part` file and metadata, so a small pool can
+  never deadlock; after a transient error that connection is destroyed, not reused.
+* **Credentials** are asked once per host (concurrent threads wait for the first
+  answer) and handed to your provider's optional `remember` hook after the server
+  accepted them, or `invalidate` hook if it did not (`AuthenticationError`, never retried).
+  Providers: `StaticCredentials`, `EnvCredentials`, `CallbackCredentials` (your GUI),
+  `PromptCredentials` (console), `KeyringCredentials`, `ChainCredentials`.
+* **Errors** are classified by NT status code (e.g. `STATUS_PIPE_BROKEN`,
+  `STATUS_NETWORK_NAME_DELETED` => resume; `STATUS_ACCESS_DENIED` => fail).
+* **Locks** use a `<name>.lock` sidecar opened so that other writers get
+  `STATUS_SHARING_VIOLATION`; your existing destination is never truncated by locking.
+* **Names**: remote path components are normalised to Unicode NFC (macOS sends NFD);
+  `sanitize_names=True` replaces characters Windows forbids.
+* `backend.check_connection(uri)` is a "Test connection" helper;
+  `backend.pause_new_connections()` / `resume_new_connections()` hold back new
+  connections, e.g. while a dialog is open.
+
+### One dialog for many failures
+
+When a link drops, every parallel copy fails at once. `BatchedFailurePrompt`
+gathers them into a single question:
+
+```python
+prompt = BatchedFailurePrompt(
+    ask=lambda files: ask_user_to_retry(files),          # runs on a helper thread
+    before=backend.pause_new_connections, after=backend.resume_new_connections)
+copy_file(src, dst, on_failure=prompt)                   # same object for every copy
+```
+
+### Testing against a real server
+
+The SMB tests in the normal suite use `tests/fake_smb.py`, an in-memory imitation of
+`smbclient`. It encodes **our understanding** of the library, so passing them does not
+prove that understanding right. These points were written from memory and need
+confirming against smbprotocol and a real server:
+
+* the `smbclient` calls and keyword arguments used (`open_file(share_access=...)`,
+  `replace`, `utime(times=...)`, `register_session(connection_timeout=...)`,
+  `reset_connection_cache(connection_cache=...)`), and `truncate()` on `r+b` files;
+* the exception attributes carrying the NT status (`ntstatus` / `status`), the status
+  values in `backends/smb.py::_STATUS`, and the `"credits are available"` message
+  marker (taken from the original project);
+* what `share_access=None` means (the lock is written to work with either default).
+
+`tests/test_real_smb.py` checks exactly these. Point it at a scratch folder:
+
+```
+export CAREFULCOPY_TEST_SMB_URI='smb://nas.local/share/carefulcopy-tests'
+export CAREFULCOPY_TEST_SMB_USER=alice CAREFULCOPY_TEST_SMB_PASSWORD=secret
+cd tests && PYTHONPATH=../src python -m unittest test_real_smb -v
+```
+
+Not ported from the original on purpose: Qt dialogs, the ping pre-check, the 15 s
+cool-down between credential prompts, and locking by truncating the destination.
+
+## Writing a backend
+
+Subclass `carefulcopy.Backend` (stat, listdir, open_read, open_write(offset),
+makedirs, remove, rename, set_mtime, lock) and register it:
+
+```python
+from carefulcopy import register_backend
+register_backend("myfs", lambda loc: MyBackend(loc.netloc))
+```
+
+Override `is_transient(exc)` to tell the engine which errors mean
+"connection problem, resume me" versus "give up".
+
+## Behaviour notes
+
+* `copy_file` returns `False` only when aborted. If retries run out (or your
+  `on_failure` callback declines), `CopyError` is raised with the last error as `__cause__`.
+* The destination lock is a `<name>.lock` sidecar using OS advisory locks, so a
+  crashed process never leaves a stale lock. Windows support is implemented via
+  `msvcrt` but not yet covered by CI.
+* Resuming trusts the existing `.part` prefix and checks only size and the
+  source fingerprint (size + mtime). Hash verification is not implemented.
+
+## Roadmap
+
+1. ~~Engine, local backend, tests~~
+2. ~~Bandwidth throttling (adaptive + fixed rate)~~
+3. ~~SMB backend, connection pool, credential providers, batched retry prompt~~ (verify on a real server!)
+4. `copy_tree` / `copy_many` with aggregated progress
+5. Examples (Qt retry dialog, CLI), CI, license
+
+## Development
+
+```
+cd tests && PYTHONPATH=../src python -m unittest discover -v    # or: pytest   (147 tests, ~5 s)
+
+The suite has a 120 s watchdog (`faulthandler`) that dumps all stacks and exits if a
+test ever hangs. Throttle tests use a virtual clock, so they run in milliseconds.
+```
