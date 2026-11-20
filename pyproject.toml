@@ -12,6 +12,7 @@ dependencies = []
 
 [project.optional-dependencies]
 smb = ["smbprotocol>=1.10"]
+keyring = ["keyring"]
 dev = ["pytest>=7"]
 
 [tool.setuptools.packages.find]

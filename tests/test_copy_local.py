@@ -2,7 +2,7 @@ import os
 import threading
 import unittest
 
-from carefulcopy import (CopyError, Location, LocalBackend, SourceChangedError, copy_file)
+from carefulcopy import (CopyError, CopyOptions, Location, LocalBackend, SourceChangedError, copy_file)
 
 from helpers import Base
 
@@ -61,13 +61,10 @@ class BasicTests(Base):
 
 
 class ResumeTests(Base):
-    def part_name(self, name, size, mtime=1_700_000_000):
-        return f"{name}.part.{size}-{mtime}"
-
     def test_resumes_existing_part(self):
         src, data = self.write_src(size=10 * 1024)
         dst = self.path("dst.bin")
-        with open(self.path(self.part_name("dst.bin", len(data))), "wb") as f:
+        with open(self.path(self.part_name(src, "dst.bin")), "wb") as f:
             f.write(data[:4096])
         seen = []
         copy_file(src, dst, options=self.opts(), progress=lambda s, c, t: seen.append(c))
@@ -77,7 +74,7 @@ class ResumeTests(Base):
 
     def test_oversized_part_restarts_from_zero(self):
         src, data = self.write_src(size=2048)
-        with open(self.path(self.part_name("dst.bin", 2048)), "wb") as f:
+        with open(self.path(self.part_name(src, "dst.bin")), "wb") as f:
             f.write(b"x" * 9999)
         seen = []
         copy_file(src, self.path("dst.bin"), options=self.opts(), progress=lambda s, c, t: seen.append(c))
@@ -86,7 +83,7 @@ class ResumeTests(Base):
 
     def test_resume_disabled(self):
         src, data = self.write_src(size=4096)
-        with open(self.path(self.part_name("dst.bin", 4096)), "wb") as f:
+        with open(self.path(self.part_name(src, "dst.bin")), "wb") as f:
             f.write(b"junk" * 256)
         seen = []
         copy_file(src, self.path("dst.bin"), options=self.opts(resume=False),
@@ -110,6 +107,111 @@ class ResumeTests(Base):
         open(stale, "wb").close()
         copy_file(src, self.path("dst.bin"), options=self.opts(use_locks=False))
         self.assertTrue(os.path.exists(stale))
+
+
+class ResumeSafetyTests(Base):
+    def abort_midway(self, src, dst, at=6000, **kw):
+        ev = threading.Event()
+        copy_file(src, dst, abort=ev, options=self.opts(keep_partial_on_abort=True, **kw),
+                  progress=lambda s, c, t: ev.set() if c >= at else None)
+        return [n for n in os.listdir(os.path.dirname(dst)) if ".part." in n]
+
+    def test_a_different_source_with_the_same_size_and_mtime_is_never_resumed(self):
+        a, A = self.write_src("a.bin", size=10 * 1024)
+        b, B = self.write_src("b.bin", size=10 * 1024)     # same size, same mtime, other content
+        self.assertNotEqual(A, B)
+        dst = self.path("d.bin")
+        self.assertEqual(len(self.abort_midway(a, dst)), 1)       # A's copy dies half way
+        seen = []
+        copy_file(b, dst, options=self.opts(), progress=lambda s, c, t: seen.append(c))
+        self.assertEqual(seen[0], 0)                               # A's partial file was not touched
+        self.assertEqual(self.read(dst), B)                        # (it used to yield A's first bytes + B's rest)
+        self.assertEqual([n for n in os.listdir(self.root) if ".part." in n], [])
+
+    def test_the_same_file_from_another_path_starts_over(self):
+        a, A = self.write_src("a.bin", size=10 * 1024)
+        c = self.path("copy-of-a.bin")
+        with open(c, "wb") as f:
+            f.write(A)
+        os.utime(c, (1_700_000_000, 1_700_000_000))
+        dst = self.path("d.bin")
+        self.abort_midway(a, dst)
+        seen = []
+        copy_file(c, dst, options=self.opts(), progress=lambda s, c_, t: seen.append(c_))
+        self.assertEqual(seen[0], 0)                               # accepted trade-off: path is part of identity
+        self.assertEqual(self.read(dst), A)
+
+    def test_the_part_name_encodes_size_mtime_and_source(self):
+        from carefulcopy.copier import part_filename
+        n1 = part_filename("d", "/x/a", 10, 5)
+        self.assertNotEqual(n1, part_filename("d", "/x/b", 10, 5))
+        self.assertNotEqual(n1, part_filename("d", "/x/a", 11, 5))
+        self.assertNotEqual(n1, part_filename("d", "/x/a", 10, 6))
+        self.assertEqual(n1, part_filename("d", "/x/a", 10, 5))
+
+    def test_sub_second_mtime_changes_are_noticed(self):
+        a, _ = self.write_src("a.bin", size=4096)
+        before = self.part_name(a, "d")
+        os.utime(a, ns=(1_700_000_000_000_000_000, 1_700_000_000_500_000_000))
+        self.assertNotEqual(before, self.part_name(a, "d"))
+
+    def test_healthy_partial_file_is_resumed_without_restarting(self):
+        src, data = self.write_src(size=10 * 1024)
+        dst = self.path("d.bin")
+        self.abort_midway(src, dst, at=6000)
+        seen = []
+        copy_file(src, dst, options=self.opts(), progress=lambda s, c, t: seen.append(c))
+        self.assertGreaterEqual(seen[0], 6000)
+        self.assertNotIn(0, seen[1:])
+        self.assertEqual(self.read(dst), data)
+
+    def corrupt_tail(self, part_path, n=300):
+        size = os.path.getsize(part_path)
+        with open(part_path, "r+b") as f:
+            f.seek(size - n)
+            f.write(b"\0" * n)
+        return size
+
+    def test_a_torn_tail_is_detected_and_the_copy_restarts_from_zero(self):
+        src, data = self.write_src(size=10 * 1024)
+        dst = self.path("d.bin")
+        (part,) = self.abort_midway(src, dst)
+        size = self.corrupt_tail(self.path(part))
+        seen = []
+        copy_file(src, dst, options=self.opts(), progress=lambda s, c, t: seen.append(c))
+        self.assertEqual(seen[0], size)
+        self.assertIn(0, seen[1:])
+        self.assertEqual(self.read(dst), data)
+
+    def test_verification_can_be_switched_off_and_then_corruption_slips_through(self):
+        src, data = self.write_src(size=10 * 1024)
+        dst = self.path("d.bin")
+        (part,) = self.abort_midway(src, dst)
+        self.corrupt_tail(self.path(part))
+        copy_file(src, dst, options=self.opts(resume_verify="none"))
+        self.assertNotEqual(self.read(dst), data)                  # the documented price of "none"
+
+    def test_only_the_configured_tail_is_compared(self):
+        src, data = self.write_src(size=10 * 1024)
+        dst = self.path("d.bin")
+        (part,) = self.abort_midway(src, dst)
+        p = self.path(part)
+        size = os.path.getsize(p)
+        with open(p, "r+b") as f:                                  # damage far from the tail
+            f.seek(100)
+            f.write(b"\xff" * 50)
+        copy_file(src, dst, options=self.opts(resume_verify_bytes=256))
+        self.assertNotEqual(self.read(dst), data)                  # outside the window: not noticed
+        self.assertGreaterEqual(size, 6000)
+
+    def test_invalid_verify_mode_is_rejected(self):
+        with self.assertRaises(ValueError):
+            CopyOptions(resume_verify="sometimes")
+
+    def test_file_info_derives_nanoseconds_when_the_backend_has_none(self):
+        from carefulcopy import FileInfo
+        self.assertEqual(FileInfo(1, 1700000000.5).mtime_key(), 1_700_000_000_500_000_000)
+        self.assertEqual(FileInfo(1, 1.0, mtime_ns=7).mtime_key(), 7)
 
 
 class RetryTests(Base):

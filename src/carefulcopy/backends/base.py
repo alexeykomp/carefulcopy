@@ -4,7 +4,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import Any, BinaryIO, ContextManager, List
+from typing import Any, BinaryIO, ContextManager, List, Optional
 
 from ..location import Location
 from ..retry import is_transient_error
@@ -15,6 +15,11 @@ class FileInfo:
     size: int
     mtime: float
     is_dir: bool = False
+    mtime_ns: Optional[int] = None   # exact modification time, if the backend knows it
+
+    def mtime_key(self) -> int:
+        """Modification time in nanoseconds, for fingerprints (derived from ``mtime`` if needed)."""
+        return self.mtime_ns if self.mtime_ns is not None else int(round(self.mtime * 1_000_000_000))
 
 
 class Backend(ABC):
@@ -57,6 +62,8 @@ class Backend(ABC):
         ``offset == 0``: create or truncate.
         ``offset > 0``: the file must exist; position at *offset* and discard
         anything after it, so a resumed transfer overwrites any torn tail.
+        The handle must also be **readable** and seekable (the engine re-reads
+        the tail of a partial file to verify it before resuming).
         """
 
     # -- namespace --------------------------------------------------------
@@ -72,11 +79,15 @@ class Backend(ABC):
 
     # -- concurrency ------------------------------------------------------
     @abstractmethod
-    def lock(self, loc: Location) -> AbstractContextManager:
+    def lock(self, loc: Location, owner: Optional[str] = None) -> AbstractContextManager:
         """Return a context manager holding an exclusive write lock for *loc*.
 
         Entering must raise :class:`~carefulcopy.errors.LockedError` immediately
         (not block) if another operation already holds it.
+
+        *owner* is a token that stays the same across the retries of one copy.
+        Backends whose locks can outlive a dropped connection (SMB) use it to
+        recognise their own stale lock and take it over.
         """
 
     # -- connection lifetime ----------------------------------------------

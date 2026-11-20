@@ -110,7 +110,7 @@ class OperationTests(SMBCase):
         self.server.put("nas", "share", "p", b"01")
         with self.assertRaises(TransientError):
             self.backend.open_write(self.loc("p"), offset=4)
-        self.assertEqual(self.server.handles, [])   # nothing left open
+        self.assertEqual(self.server.live_handles, [])   # nothing left open
 
 
 class SessionTests(SMBCase):

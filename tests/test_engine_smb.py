@@ -1,3 +1,4 @@
+import json
 import os
 import threading
 import time
@@ -6,6 +7,8 @@ import unittest
 from carefulcopy import (AuthenticationError, BatchedFailurePrompt, CopyError, CopyOptions, StaticCredentials,
                          copy_file)
 
+from carefulcopy.backends import smb as smb_module
+from fake_smb import _Handle, _Sess
 from helpers_smb import SMBCase
 
 MTIME = 1_700_000_000
@@ -27,7 +30,7 @@ class CopyOverSMBTests(SMBCase):
 
         self.assertTrue(copy_file(up, self.uri("copy.bin"), options=self.opts()))
         self.assertEqual(self.server.get("nas", "share", "copy.bin"), data)
-        self.assertEqual(self.server.handles, [])
+        self.assertEqual(self.server.live_handles, [])
 
     def test_file_in_share_root(self):
         src, data = self.write_src(size=2048)
@@ -74,7 +77,7 @@ class ResumeOverSMBTests(SMBCase):
         self.assertEqual([m for m, _ in part_opens], ["wb", "r+b"])       # fresh, then resumed
         self.assertGreaterEqual(self.server.reset_calls, 1)               # broken connection destroyed
         self.assertEqual(self.server.names("nas", "share"), ["d.bin"])    # part and lock cleaned up
-        self.assertEqual(self.server.handles, [])
+        self.assertEqual(self.server.live_handles, [])
 
     def test_several_drops_in_a_row(self):
         src, data = self.write_src(size=12 * 1024)
@@ -88,10 +91,22 @@ class ResumeOverSMBTests(SMBCase):
 
     def test_resume_from_a_part_left_by_an_earlier_run(self):
         src, data = self.write_src(size=10 * 1024)
-        self.server.put("nas", "share", f"d.bin.part.{len(data)}-{MTIME}", data[:6000])
+        self.server.put("nas", "share", self.part_name(src, "d.bin"), data[:6000])
         seen = []
         copy_file(src, self.uri("d.bin"), options=self.opts(), progress=lambda s, c, t: seen.append(c))
         self.assertEqual(seen[0], 6000)
+        self.assertEqual(self.server.get("nas", "share", "d.bin"), data)
+
+    def test_a_torn_tail_on_the_server_is_detected_and_the_copy_restarts(self):
+        src, data = self.write_src(size=10 * 1024)
+        part = self.part_name(src, "d.bin")
+        torn = bytearray(data[:6000])
+        torn[-300:] = b"\0" * 300                       # last bytes never made it to disk
+        self.server.put("nas", "share", part, bytes(torn))
+        seen = []
+        copy_file(src, self.uri("d.bin"), options=self.opts(), progress=lambda s, c, t: seen.append(c))
+        self.assertEqual(seen[0], 6000)                   # it first tried to resume...
+        self.assertIn(0, seen[1:])                        # ...noticed, and started over
         self.assertEqual(self.server.get("nas", "share", "d.bin"), data)
 
     def test_abort_can_keep_the_partial_file_for_a_later_resume(self):
@@ -114,7 +129,7 @@ class ResumeOverSMBTests(SMBCase):
         copy_file(src, self.uri("d.bin"), abort=ev, options=self.opts(),
                   progress=lambda s, c, t: ev.set() if c >= 3072 else None)
         self.assertEqual(self.server.names("nas", "share"), [])
-        self.assertEqual(self.server.handles, [])
+        self.assertEqual(self.server.live_handles, [])
 
     def test_stale_part_of_another_version_is_removed(self):
         src, _ = self.write_src(size=2048)
@@ -159,6 +174,95 @@ class LockingOverSMBTests(SMBCase):
             release.set()
             t.join(5)
         self.assertIsNone(self.server.get("nas", "share", "d.bin"))
+
+
+class ZombieLockTests(SMBCase):
+    """After a silent connection drop the server still holds our old handles. Who may take them?"""
+
+    def plant_lock(self, name, process, owner, alive, share="rd", host="other-host", pid=4242):
+        """A lock sidecar that someone else's (or a dead connection's) handle keeps open."""
+        token = {"v": 1, "owner": owner, "process": process, "host": host, "pid": pid, "started": time.time()}
+        self.server.put("nas", "share", f"{name}.lock", json.dumps(token).encode())
+        sess = _Sess()
+        sess.dead = not alive
+        self.server.sessions.append(sess)
+        self.server.handles.append(_Handle(("nas", "share", f"{name}.lock"), sess, share, True, True))
+        return sess
+
+    def copy_quickly(self, src, name="d.bin", **kw):
+        return copy_file(src, self.uri(name), options=self.opts(**kw))
+
+    def test_our_own_zombie_lock_is_taken_over_immediately(self):
+        src, data = self.write_src(size=10 * 1024)
+        self.server.write_failures = [3500]
+        started = time.time()
+        self.assertTrue(self.copy_quickly(src, lock_wait_timeout=0.5))      # would time out if it had to wait
+        self.assertLess(time.time() - started, 0.5)
+        self.assertTrue(self.server.zombie_handles, "the scenario must really leave zombies behind")
+        self.assertEqual(self.server.get("nas", "share", "d.bin"), data)
+        self.assertEqual(self.server.names("nas", "share"), ["d.bin"])        # no lock, no tombstone, no part
+
+    def test_samba_style_servers_that_free_handles_on_reset_work_too(self):
+        self.server.release_handles_on_drop = True
+        src, data = self.write_src(size=10 * 1024)
+        self.server.write_failures = [3500]
+        self.assertTrue(self.copy_quickly(src, lock_wait_timeout=0.5))
+        self.assertEqual(self.server.get("nas", "share", "d.bin"), data)
+
+    def test_stale_lock_of_a_finished_copy_in_this_process_is_ours_to_break(self):
+        src, data = self.write_src()
+        self.plant_lock("d.bin", smb_module._PROCESS_ID, owner="a-copy-that-is-over", alive=False)
+        self.assertTrue(self.copy_quickly(src, lock_wait_timeout=0.5))
+        self.assertEqual(self.server.get("nas", "share", "d.bin"), data)
+
+    def test_a_copy_that_is_still_running_here_is_never_broken(self):
+        src, _ = self.write_src()
+        self.plant_lock("d.bin", smb_module._PROCESS_ID, owner="live-op", alive=True)
+        with smb_module._active("live-op"):                   # that copy is mid-flight in another thread
+            with self.assertRaises(CopyError) as cm:
+                self.copy_quickly(src, lock_wait_timeout=0.3)
+        self.assertIn("held by other-host", str(cm.exception))
+        self.assertIsNotNone(self.server.get("nas", "share", "d.bin.lock"))
+        self.assertIsNone(self.server.get("nas", "share", "d.bin"))
+
+    def test_another_process_is_never_broken_even_if_its_connection_looks_dead(self):
+        """A restarted application cannot know whether the previous run's handle is really dead."""
+        src, data = self.write_src()
+        self.plant_lock("d.bin", process="previous-run-of-the-app", owner="x", alive=False)
+        with self.assertRaises(CopyError) as cm:
+            self.copy_quickly(src, lock_wait_timeout=0.3)
+        self.assertIn("pid 4242", str(cm.exception))
+        # ...and it proceeds once the server itself lets go of the dead connection
+        threading.Timer(0.3, self.server.expire_zombies).start()
+        self.assertTrue(self.copy_quickly(src, lock_wait_timeout=10))
+        self.assertEqual(self.server.get("nas", "share", "d.bin"), data)
+
+    def test_unreadable_token_counts_as_someone_else(self):
+        src, _ = self.write_src()
+        self.server.put("nas", "share", "d.bin.lock", b"\x00not json")
+        sess = _Sess()
+        self.server.sessions.append(sess)
+        self.server.handles.append(_Handle(("nas", "share", "d.bin.lock"), sess, "rd", True, True))
+        with self.assertRaises(CopyError):
+            self.copy_quickly(src, lock_wait_timeout=0.3)
+
+    def test_when_the_server_refuses_the_takeover_we_fall_back_to_waiting(self):
+        src, _ = self.write_src()
+        # holder's share mask lacks 'd', so the rename is refused with a sharing violation
+        self.plant_lock("d.bin", smb_module._PROCESS_ID, owner="gone", alive=False, share="r")
+        with self.assertRaises(CopyError):
+            self.copy_quickly(src, lock_wait_timeout=0.3)
+
+    def test_lock_sidecar_carries_a_readable_token(self):
+        with self.backend.lock(self.loc("d.bin"), owner="op-123"):
+            token = json.loads(self.server.get("nas", "share", "d.bin.lock"))
+        self.assertEqual((token["owner"], token["process"], token["pid"]),
+                         ("op-123", smb_module._PROCESS_ID, os.getpid()))
+
+    def test_active_owner_registry_is_cleaned_up(self):
+        with self.backend.lock(self.loc("d.bin"), owner="op-xyz"):
+            self.assertTrue(smb_module._owner_is_active("op-xyz"))
+        self.assertFalse(smb_module._owner_is_active("op-xyz"))
 
 
 class AuthOverSMBTests(SMBCase):
@@ -225,7 +329,7 @@ class ConcurrencyOverSMBTests(SMBCase):
         for i, (_, data) in enumerate(files):
             self.assertEqual(self.server.get("nas", "share", f"out/d{i}.bin"), data)
         self.assertLessEqual(b._pool.stats()["total"], 2)
-        self.assertEqual(self.server.handles, [])
+        self.assertEqual(self.server.live_handles, [])
 
     def test_simultaneous_failures_produce_one_question(self):
         files = [self.write_src(name=f"s{i}.bin", size=8 * 1024) for i in range(3)]

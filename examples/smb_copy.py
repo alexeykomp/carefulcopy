@@ -8,8 +8,7 @@ from carefulcopy import (AdaptiveThrottle, ChainCredentials, EnvCredentials, Pro
                          configure_smb, copy_file)
 
 if __name__ == "__main__":
-    src, dst = "D:\\PSAutoRecover\\a.jpg", "smb://192.168.178.1/FRITZ.NAS/DATABASE/Download/123.jpg"
-
+    src, dst = sys.argv[1:3]
     backend = configure_smb(ChainCredentials(EnvCredentials(), PromptCredentials()))
     try:
         ok = copy_file(src, dst, throttle=AdaptiveThrottle(),

@@ -27,13 +27,16 @@ audit against the library's documentation.
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import os
 import re
+import socket
 import stat as stat_mod
 import threading
 import time
 import unicodedata
+import uuid
 from contextlib import contextmanager
 from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -110,6 +113,34 @@ def _ntstatus(exc: BaseException) -> Optional[int]:
     if m:
         return _STATUS.get(m.group(0))
     return None
+
+
+# Who is allowed to claim a stale lock as "mine"? Only locks written by this very process whose
+# owner is not currently inside a ``lock()`` block (so: the copy that wrote it is over, and the
+# server-side handle is a leftover of a dead connection). Another thread's live lock is never touched.
+_PROCESS_ID = uuid.uuid4().hex
+_ACTIVE_OWNERS: Dict[str, int] = {}
+_ACTIVE_LOCK = threading.Lock()
+
+
+@contextmanager
+def _active(owner: str) -> Iterator[None]:
+    with _ACTIVE_LOCK:
+        _ACTIVE_OWNERS[owner] = _ACTIVE_OWNERS.get(owner, 0) + 1
+    try:
+        yield
+    finally:
+        with _ACTIVE_LOCK:
+            n = _ACTIVE_OWNERS.get(owner, 1) - 1
+            if n <= 0:
+                _ACTIVE_OWNERS.pop(owner, None)
+            else:
+                _ACTIVE_OWNERS[owner] = n
+
+
+def _owner_is_active(owner: Any) -> bool:
+    with _ACTIVE_LOCK:
+        return owner in _ACTIVE_OWNERS
 
 
 class _Session:
@@ -466,7 +497,8 @@ class SMBBackend(Backend):
     def stat(self, loc: Location) -> FileInfo:
         with self._conn(loc) as (unc, kw):
             st = self._smb.stat(unc, **kw)
-        return FileInfo(size=st.st_size, mtime=st.st_mtime, is_dir=stat_mod.S_ISDIR(st.st_mode))
+        return FileInfo(size=st.st_size, mtime=st.st_mtime, is_dir=stat_mod.S_ISDIR(st.st_mode),
+                        mtime_ns=getattr(st, "st_mtime_ns", None))
 
     def listdir(self, loc: Location) -> List[str]:
         with self._conn(loc) as (unc, kw):
@@ -563,15 +595,44 @@ class SMBBackend(Backend):
     # Backend API: locking
     # ------------------------------------------------------------------
     @contextmanager
-    def lock(self, loc: Location) -> Iterator[None]:
-        lock_loc = loc.with_name(loc.name + ".lock")
-        handle = self._acquire_lock(lock_loc)
-        try:
-            yield
-        finally:
-            self._release_lock(handle, lock_loc)
+    def lock(self, loc: Location, owner: Optional[str] = None) -> Iterator[None]:
+        """Exclusive write lock on *loc*, held as an open ``<name>.lock`` handle.
 
-    def _acquire_lock(self, lock_loc: Location) -> _SMBFile:
+        The sidecar also contains a small JSON token (owner, process, host, pid). It is purely
+        advisory - the real exclusion is the share mode of the open handle - but it lets us tell
+        apart three situations when the lock is busy:
+
+        * the holder is **our own stale handle** (same process, and the copy that took it is no
+          longer running - typically left behind by a connection that dropped without the server
+          noticing yet): we take it over;
+        * the holder is **someone else** (another process or machine, or a copy that is still
+          running here): we raise :class:`LockedError` naming the holder, and the caller waits;
+        * the token is unreadable: treated like someone else.
+        """
+        owner = owner or uuid.uuid4().hex
+        lock_loc = loc.with_name(loc.name + ".lock")
+        with _active(owner):
+            handle = self._acquire_lock(lock_loc, owner)
+            try:
+                yield
+            finally:
+                self._release_lock(handle, lock_loc)
+
+    def _acquire_lock(self, lock_loc: Location, owner: str) -> _SMBFile:
+        took_over = False
+        while True:
+            try:
+                handle = self._open_lock_handle(lock_loc)
+            except LockedError as busy:
+                holder = self._read_lock_token(lock_loc)
+                if not took_over and self._is_own_stale_lock(holder, owner) and self._take_over(lock_loc):
+                    took_over = True
+                    continue
+                raise LockedError(self._describe_holder(lock_loc, holder)) from busy
+            self._write_lock_token(handle, owner)
+            return handle
+
+    def _open_lock_handle(self, lock_loc: Location) -> _SMBFile:
         # 1) make sure the sidecar exists (and is empty)
         for _ in range(5):
             try:
@@ -583,17 +644,77 @@ class SMBBackend(Backend):
                     time.sleep(0.2)
                     continue
                 if status == _SHARING_VIOLATION:
-                    raise LockedError(f"{lock_loc} is held by another operation") from exc
+                    raise LockedError(f"{lock_loc.name} is held by another operation") from exc
                 raise
         else:
-            raise LockedError(f"{lock_loc}: still being deleted by another operation")
+            raise LockedError(f"{lock_loc.name}: still being deleted by another operation")
         # 2) hold it open, refusing write access to everybody else
         try:
             return self._open_file(lock_loc, "r+b", "rd")
         except Exception as exc:
             if _ntstatus(exc) in (_SHARING_VIOLATION, _DELETE_PENDING):
-                raise LockedError(f"{lock_loc} is held by another operation") from exc
+                raise LockedError(f"{lock_loc.name} is held by another operation") from exc
             raise
+
+    def _write_lock_token(self, handle: _SMBFile, owner: str) -> None:
+        token = {"v": 1, "owner": owner, "process": _PROCESS_ID, "host": socket.gethostname(),
+                 "pid": os.getpid(), "started": time.time()}
+        try:
+            handle.seek(0)
+            handle.write(json.dumps(token).encode("utf-8"))
+            handle.flush()
+        except Exception as exc:
+            if self.is_transient(exc):
+                raise
+            logger.debug("could not write the lock token: %s", exc)   # the lock itself still works
+
+    def _read_lock_token(self, lock_loc: Location) -> Optional[dict]:
+        """Read the holder's token, or None if it is missing/unreadable. The holder has the file
+        open for writing, so we must allow write sharing ('rwd') to be admitted."""
+        try:
+            with self._open_file(lock_loc, "rb", "rwd") as f:
+                raw = f.read(4096)
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else None
+        except Exception as exc:
+            if self.is_transient(exc):
+                raise                              # a dead link is not "someone else's lock"
+            return None
+
+    @staticmethod
+    def _is_own_stale_lock(holder: Optional[dict], owner: str) -> bool:
+        if not holder or holder.get("process") != _PROCESS_ID:
+            return False                           # other process / machine / restarted app
+        holder_owner = holder.get("owner")
+        return holder_owner == owner or not _owner_is_active(holder_owner)
+
+    def _take_over(self, lock_loc: Location) -> bool:
+        """Move the stale lock out of the way (its handle follows it; the server drops the
+        leftover whenever it notices the dead connection) so a fresh one can be created."""
+        tombstone = lock_loc.with_name(f"{lock_loc.name}.dead-{uuid.uuid4().hex[:8]}")
+        try:
+            self.rename(lock_loc, tombstone)
+        except Exception as exc:
+            if self.is_transient(exc):
+                raise
+            logger.info("could not take over stale lock %s: %s", lock_loc.name, exc)
+            return False
+        logger.info("took over our own stale lock %s", lock_loc.name)
+        try:
+            self.remove(tombstone)
+        except Exception as exc:                   # delete-pending until the zombie handle goes away
+            logger.debug("could not remove %s yet: %s", tombstone.name, exc)
+        return True
+
+    @staticmethod
+    def _describe_holder(lock_loc: Location, holder: Optional[dict]) -> str:
+        if not holder:
+            return f"{lock_loc.name} is held by another operation"
+        since = ""
+        if isinstance(holder.get("started"), (int, float)):
+            since = f" since {time.strftime('%H:%M:%S', time.localtime(holder['started']))}"
+        return (f"{lock_loc.name} is held by {holder.get('host', '?')} "
+                f"(pid {holder.get('pid', '?')}){since}")
 
     def _release_lock(self, handle: _SMBFile, lock_loc: Location) -> None:
         broken = handle._session.broken

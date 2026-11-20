@@ -91,6 +91,24 @@ class RealServerTests(unittest.TestCase):
         with self.backend.open_read(part) as f:
             self.assertEqual(f.read(), b"0123XY")
 
+    def test_a_held_lock_can_be_read_and_renamed_from_another_connection(self):
+        """The assumptions behind taking over our own stale lock after a dropped connection."""
+        other = SMBBackend(StaticCredentials(USER, PASSWORD) if USER else None, pool_size=2)
+        self.addCleanup(other.close)
+        target = self.base / "stale.bin"
+        lock_loc = target.with_name("stale.bin.lock")
+        with self.backend.lock(target, owner="holder-1"):
+            token = other._read_lock_token(lock_loc)                 # needs share mode 'rwd' to be admitted
+            self.assertIsNotNone(token, "could not read the token of a held lock")
+            self.assertEqual(token["owner"], "holder-1")
+            with self.assertRaises(LockedError):                      # still really locked
+                with other.lock(target, owner="competitor"):
+                    pass
+            self.assertTrue(other._take_over(lock_loc),               # needs delete sharing ('d') to be allowed
+                            "server refused to rename a lock file held open with share mode 'rd'")
+            with other.lock(target, owner="competitor"):              # a fresh lock can now be taken
+                pass
+
     def test_rename_replaces_an_existing_file(self):
         for name, data in (("new", b"NEW"), ("old", b"OLD")):
             with self.backend.open_write(self.base / name) as f:

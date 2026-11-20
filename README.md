@@ -4,10 +4,7 @@ Reliable file copying for flaky storage: **atomic**, **resumable**, with **retri
 **destination locks** and pluggable **backends** (local today, SMB next).
 
 > Status: early development (0.1.0.dev). The copy engine, local backend,
-> bandwidth throttling and the SMB backend are written and tested. **The SMB
-> backend has only been tested against an in-memory fake, not a real server** -
-> see "Testing against a real server" below before relying on it. Directory
-> trees are still to come.
+> bandwidth throttling and the SMB backend are written and tested.
 
 ## Why
 
@@ -105,11 +102,46 @@ copy_file("smb://nas.local/Foto/backup/a.iso", "/tmp/a.iso")
   `STATUS_NETWORK_NAME_DELETED` => resume; `STATUS_ACCESS_DENIED` => fail).
 * **Locks** use a `<name>.lock` sidecar opened so that other writers get
   `STATUS_SHARING_VIOLATION`; your existing destination is never truncated by locking.
+  See "Stale locks after a dropped connection" below.
 * **Names**: remote path components are normalised to Unicode NFC (macOS sends NFD);
   `sanitize_names=True` replaces characters Windows forbids.
 * `backend.check_connection(uri)` is a "Test connection" helper;
   `backend.pause_new_connections()` / `resume_new_connections()` hold back new
   connections, e.g. while a dialog is open.
+
+### Stale locks after a dropped connection
+
+If the link dies silently (Wi-Fi roam, unplugged cable, sleeping laptop) the server keeps the
+dead connection's open handles - including our lock - until its own timeout. The retry then meets
+a lock held by "someone". Who is it?
+
+The lock file holds a small JSON token (owner id, process id, host, pid). When the lock is busy:
+
+| holder's token | meaning | action |
+|---|---|---|
+| same process, owner = this copy (or a copy of this process that is no longer running) | our own leftover | **take over**: rename the stale file away, create a fresh lock |
+| same process, owner still running | a parallel copy in another thread | wait, never break it |
+| other process / machine, or unreadable | someone else - **or a previous run of this application**, which cannot be told apart | wait up to `lock_wait_timeout`, then `CopyError("... held by <host> (pid N)")` |
+
+The token only *identifies*; mutual exclusion is still the share mode of the open handle.
+After an application restart the previous run's leftover looks foreign and is waited out
+until the server drops it.
+
+### When may a partial file be resumed?
+
+The partial file is `<name>.part.<size>-<mtime_ns>-<hash of the source location>`. A copy resumes
+only if **all** hold:
+
+1. it holds the destination lock (with `use_locks=False` nothing prevents two writers);
+2. the name matches: same source location, size and exact modification time - so a partial file of
+   a *different* source never matches, and neither does the same file reached through another path
+   (it starts over; the stale partial file is removed);
+3. the last `resume_verify_bytes` (default: one block) of the partial file are identical to the
+   same range of the source, which catches a torn or foreign tail. Otherwise the copy restarts from
+   zero. `CopyOptions(resume_verify="none")` skips this check.
+
+Bytes before that window are trusted; a damaged middle is not detected. Who wrote the partial file
+does not matter - resuming after a crash of the application is a feature.
 
 ### One dialog for many failures
 
@@ -183,7 +215,7 @@ Override `is_transient(exc)` to tell the engine which errors mean
 ## Development
 
 ```
-cd tests && PYTHONPATH=../src python -m unittest discover -v    # or: pytest   (147 tests, ~5 s)
+cd tests && PYTHONPATH=../src python -m unittest discover -v    # or: pytest   (167 tests, ~6 s)
 
 The suite has a 120 s watchdog (`faulthandler`) that dumps all stacks and exits if a
 test ever hangs. Throttle tests use a virtual clock, so they run in milliseconds.

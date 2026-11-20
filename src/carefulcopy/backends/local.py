@@ -5,7 +5,7 @@ import errno
 import os
 import stat as stat_mod
 from contextlib import contextmanager
-from typing import BinaryIO, Iterator, List
+from typing import BinaryIO, Iterator, List, Optional
 
 from ..errors import LockedError
 from ..location import Location
@@ -48,7 +48,8 @@ class LocalBackend(Backend):
 
     def stat(self, loc: Location) -> FileInfo:
         st = os.stat(self._p(loc))
-        return FileInfo(size=st.st_size, mtime=st.st_mtime, is_dir=stat_mod.S_ISDIR(st.st_mode))
+        return FileInfo(size=st.st_size, mtime=st.st_mtime, is_dir=stat_mod.S_ISDIR(st.st_mode),
+                        mtime_ns=st.st_mtime_ns)
 
     def listdir(self, loc: Location) -> List[str]:
         return os.listdir(self._p(loc))
@@ -82,11 +83,12 @@ class LocalBackend(Backend):
 
     # -- locking ----------------------------------------------------------
     @contextmanager
-    def lock(self, loc: Location) -> Iterator[None]:
+    def lock(self, loc: Location, owner: Optional[str] = None) -> Iterator[None]:
         """Advisory lock on a ``<name>.lock`` sidecar file.
 
         The OS drops the lock automatically if the process dies, so a crash
-        never leaves a stale lock behind (only an empty sidecar file).
+        never leaves a stale lock behind (only an empty sidecar file), so *owner*
+        is not needed here.
         """
         lock_path = self._p(loc.with_name(loc.name + ".lock"))
         fh = self._acquire(lock_path)

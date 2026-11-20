@@ -64,7 +64,9 @@ class FakeServer:
         self.register_calls = []
         self.reset_calls = 0
         self.open_log = []              # (path, mode, share)
-        self.release_handles_on_drop = True
+        # False = a silent drop: the server keeps the dead connection's handles until it notices
+        # (call expire_zombies()). True = Samba-style cleanup on TCP reset.
+        self.release_handles_on_drop = False
         self.dead_calls = 0             # operations attempted on an already-dead connection
         self.latency = 0.0              # seconds per read/write call (makes parallel copies overlap)
         self.default_share = ""         # what share_access=None means; real smbclient's default is unverified
@@ -92,6 +94,19 @@ class FakeServer:
                 if len(k) == len(base) + 1 and k[:len(base)] == base:
                     out.add(k[-1])
         return sorted(out)
+
+    @property
+    def live_handles(self):
+        return [h for h in self.handles if not h.sess.dead]
+
+    @property
+    def zombie_handles(self):
+        return [h for h in self.handles if h.sess.dead]
+
+    def expire_zombies(self):
+        """The server finally notices the dead connections and closes their handles."""
+        with self.lock:
+            self.handles = [h for h in self.handles if not h.sess.dead]
 
     def kill_sessions(self):
         with self.lock:
@@ -227,6 +242,9 @@ class FakeClient:
                 if self._busy(dk):
                     raise SMBOSError(ST["SHARING"], dst)
             self.s.files[dk] = self.s.files.pop(sk)
+            for h in self.s.handles:               # open handles follow the file, not the name
+                if h.key == sk:
+                    h.key = dk
 
     # -- data -----------------------------------------------------------
     def open_file(self, path, mode="r", share_access=None, connection_cache=None, **kw):

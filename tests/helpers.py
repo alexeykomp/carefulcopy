@@ -5,6 +5,7 @@ import time
 import unittest
 
 from carefulcopy import CopyOptions, Location, LocalBackend, register_backend, unregister_backend
+from carefulcopy.copier import part_filename, source_key
 
 # Watchdog: if the whole run hangs, dump every thread's stack and exit instead of
 # blocking forever. (Imported by every test module.)
@@ -80,10 +81,16 @@ class Base(unittest.TestCase):
         os.utime(p, (mtime, mtime))
         return p, data
 
+    def part_name(self, src, dst_name):
+        """The real name the engine gives the partial file for this source."""
+        st = os.stat(src)
+        return part_filename(dst_name, source_key(Location.local(src)), st.st_size, st.st_mtime_ns)
+
     def opts(self, **kw):
         kw.setdefault("block_size", self.BLOCK)
         kw.setdefault("retry_delay", 0)
         kw.setdefault("lock_retry_interval", 0.02)
+        kw.setdefault("lock_wait_timeout", 5.0)   # a regression should fail fast, not wait a minute
         return CopyOptions(**kw)
 
     def flaky_loc(self, *parts):

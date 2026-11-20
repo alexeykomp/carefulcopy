@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 MiB = 1024 * 1024
 
@@ -41,6 +42,14 @@ class CopyOptions:
     (no ``.part`` + rename). Saves round-trips on high-latency links at the cost of
     atomicity. ``0`` (default) disables the shortcut."""
 
+    resume_verify: str = "tail"
+    """Before resuming, re-read the last ``resume_verify_bytes`` of the partial file and compare
+    them with the source. ``"tail"`` (default) catches a torn or foreign tail and restarts from
+    zero; ``"none"`` trusts the partial file blindly."""
+
+    resume_verify_bytes: Optional[int] = None
+    """How much of the tail to compare (default: ``block_size``)."""
+
     keep_partial_on_abort: bool = False
     """Keep the ``.part`` file when aborted so a later run can resume it."""
 
@@ -52,3 +61,5 @@ class CopyOptions:
             raise ValueError("block_size must be positive")
         if self.retries < 1:
             raise ValueError("retries must be >= 1")
+        if self.resume_verify not in ("tail", "none"):
+            raise ValueError("resume_verify must be 'tail' or 'none'")

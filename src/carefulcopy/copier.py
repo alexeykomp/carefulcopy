@@ -1,8 +1,11 @@
 """The copy engine: atomic, resumable, retrying single-file copy."""
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import time
+import uuid
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
 
@@ -27,6 +30,29 @@ class _State:
 
     def __init__(self) -> None:
         self.fingerprint: Optional[tuple] = None
+        # Identifies this copy_file() call across its retries. Backends whose locks can
+        # outlive a dropped connection use it to recognise their own stale lock.
+        self.op_id = uuid.uuid4().hex
+
+
+class _PartMismatch(Exception):
+    """The partial file does not match the source: it must not be resumed."""
+
+
+def source_key(src: Location) -> str:
+    """Stable text identifying the source, used in the partial file's name."""
+    return os.path.abspath(str(src.path)) if src.is_local else str(src)
+
+
+def part_filename(dst_name: str, src_key: str, size: int, mtime_ns: int) -> str:
+    """Name of the partial file.
+
+    It encodes everything a resume must agree on: the source (a hash of its location), its
+    size and its exact modification time. A partial file left by a *different* source - even
+    one with the same size and mtime second - therefore never matches.
+    """
+    digest = hashlib.sha1(src_key.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    return f"{dst_name}.part.{size}-{mtime_ns}-{digest}"
 
 
 def copy_file(
@@ -78,8 +104,7 @@ def copy_file(
                 lock_wait_started = now
             if now - lock_wait_started >= opts.lock_wait_timeout:
                 raise CopyError(
-                    f"{dst} stayed locked by another operation for "
-                    f"{opts.lock_wait_timeout:g}s"
+                    f"{dst} stayed locked for {opts.lock_wait_timeout:g}s: {exc}"
                 ) from exc
             logger.info("%s is locked by another operation, waiting...", dst)
             if sleep_abortable(opts.lock_retry_interval, abort):
@@ -125,7 +150,7 @@ def _copy_attempt(
     if info.is_dir:
         raise IsADirectoryError(f"Source is a directory: {src}")
 
-    fingerprint = (info.size, int(info.mtime))
+    fingerprint = (info.size, info.mtime_key())
     if state.fingerprint is None:
         state.fingerprint = fingerprint
     elif state.fingerprint != fingerprint:
@@ -136,25 +161,30 @@ def _copy_attempt(
     db.makedirs(dst.parent, exist_ok=True)
 
     direct = info.size < opts.direct_write_threshold
-    part = dst.with_name(f"{dst.name}.part.{info.size}-{int(info.mtime)}")
+    part = dst.with_name(part_filename(dst.name, source_key(src), info.size, info.mtime_key()))
     target = dst if direct else part
 
     with ExitStack() as held:
         if opts.use_locks:
-            held.enter_context(db.lock(dst))
+            held.enter_context(db.lock(dst, owner=state.op_id))
             _remove_stale_parts(db, dst, part)
 
         offset = 0 if direct else _resume_offset(db, target, info.size, opts)
         if offset:
             logger.info("Resuming %s from byte %d of %d", dst.name, offset, info.size)
 
-        completed = _transfer(src, sb, dst, target, db, offset, info.size, opts, abort, progress, throttle)
+        try:
+            completed = _transfer(src, sb, dst, target, db, offset, info.size, opts, abort, progress, throttle)
+        except _PartMismatch as exc:
+            logger.warning("Not resuming %s: %s - starting over", dst.name, exc)
+            _remove_quietly(db, target)       # both files are closed by now
+            completed = _transfer(src, sb, dst, target, db, 0, info.size, opts, abort, progress, throttle)
         if not completed:
             _discard_partial(db, dst, part, direct, keep=opts.keep_partial_on_abort)
             return False
 
         after = sb.stat(src)
-        if (after.size, int(after.mtime)) != fingerprint:
+        if (after.size, after.mtime_key()) != fingerprint:
             _remove_quietly(db, target)
             raise SourceChangedError(f"{src} was modified during the copy")
 
@@ -196,7 +226,14 @@ def _transfer(
         worker = stack.enter_context(throttle.worker(src, dst)) if throttle else None
         sf = stack.enter_context(sb.open_read(src))
         df = stack.enter_context(db.open_write(target, offset))
+        if offset and opts.resume_verify == "tail":
+            n = min(offset, opts.resume_verify_bytes or opts.block_size)
+            df.seek(offset - n)
+            sf.seek(offset - n)
+            if _read_exactly(df, n) != _read_exactly(sf, n):
+                raise _PartMismatch(f"the last {n} bytes of the partial file differ from the source")
         if offset:
+            df.seek(offset)
             sf.seek(offset)
         while True:
             if is_aborted(abort):
@@ -234,6 +271,18 @@ def _transfer(
     if copied < total:
         raise TransientError(f"Source ended early: got {copied} of {total} bytes from {src}")
     return True
+
+
+def _read_exactly(f: Any, n: int) -> bytes:
+    """Read *n* bytes (fewer only at EOF); file objects may return short reads."""
+    chunks, left = [], n
+    while left > 0:
+        data = f.read(left)
+        if not data:
+            break
+        chunks.append(data)
+        left -= len(data)
+    return b"".join(chunks)
 
 
 def _resume_offset(db: Backend, part: Location, total: int, opts: CopyOptions) -> int:
