@@ -15,8 +15,8 @@ faulthandler.dump_traceback_later(120, exit=True)
 class _FailingWriter:
     """Wraps a real file; raises after *limit* bytes have been written."""
 
-    def __init__(self, fh, limit, delay=0.0):
-        self._fh, self._left, self._delay = fh, limit, delay
+    def __init__(self, fh, limit, delay=0.0, on_close=None):
+        self._fh, self._left, self._delay, self._on_close = fh, limit, delay, on_close
 
     def write(self, data):
         if self._delay:
@@ -37,7 +37,15 @@ class _FailingWriter:
         return self
 
     def __exit__(self, *exc):
-        self._fh.close()
+        self.close()
+
+    def close(self):
+        try:
+            self._fh.close()
+        finally:
+            if self._on_close:
+                cb, self._on_close = self._on_close, None
+                cb()
 
 
 class FlakyBackend(LocalBackend):
@@ -48,15 +56,27 @@ class FlakyBackend(LocalBackend):
     def __init__(self):
         self.failures = []  # list of byte limits, one per upcoming open_write
         self.write_delay = 0.0  # simulated per-write network latency (seconds)
+        self.fail_names = {}    # file name -> exception to raise when it is opened for writing
+        self.active = 0         # data files currently open for writing
+        self.max_active = 0
+        self._count_lock = __import__("threading").Lock()
         self.write_offsets = []  # offsets open_write was called with
 
     def open_write(self, loc, offset=0):
         self.write_offsets.append(offset)
+        base_name = loc.name.split(".part.")[0]
+        if base_name in self.fail_names:
+            raise self.fail_names[base_name]
         fh = super().open_write(loc, offset)
         limit = self.failures.pop(0) if self.failures else None
-        if limit is None and not self.write_delay:
-            return fh
-        return _FailingWriter(fh, limit, self.write_delay)
+        with self._count_lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+
+        def left():
+            with self._count_lock:
+                self.active -= 1
+        return _FailingWriter(fh, limit, self.write_delay, on_close=left)
 
 
 class Base(unittest.TestCase):

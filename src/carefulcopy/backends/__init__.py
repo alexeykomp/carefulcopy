@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, Optional
 
 from ..errors import UnsupportedSchemeError
 from ..location import Location
-from .base import Backend, FileInfo
+from .base import Backend, Entry, FileInfo
 from .local import LocalBackend
 
 BackendFactory = Callable[[Location], Backend]
@@ -91,6 +91,6 @@ def reset_backends() -> None:
 reset_backends()
 
 __all__ = [
-    "Backend", "FileInfo", "LocalBackend",
+    "Backend", "Entry", "FileInfo", "LocalBackend",
     "register_backend", "unregister_backend", "get_backend", "configure_smb", "reset_backends",
 ]

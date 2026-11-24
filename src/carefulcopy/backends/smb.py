@@ -50,7 +50,7 @@ from ..errors import AuthenticationError, CopyError, LockedError, TransientError
 from ..location import Location
 from ..pool import ConnectionPool
 from ..retry import is_transient_error
-from .base import Backend, FileInfo
+from .base import Backend, Entry, FileInfo
 
 logger = logging.getLogger("carefulcopy.smb")
 
@@ -166,7 +166,7 @@ class _SMBFile:
             return fn(*args)
         except Exception as exc:
             if self._backend.is_transient(exc):
-                self._session.broken = True
+                self._backend._mark_broken(self._session, exc, "file I/O")
             raise
 
     def read(self, n: int = -1) -> bytes:
@@ -202,7 +202,7 @@ class _SMBFile:
                     self._raw.close()
                 except Exception as exc:
                     if self._backend.is_transient(exc):
-                        self._session.broken = True
+                        self._backend._mark_broken(self._session, exc, "closing a file")
                     error = exc
             # else: the connection is presumed dead; talking to it could hang.
         finally:
@@ -303,13 +303,24 @@ class SMBBackend(Backend):
 
     def _end_session(self, s: _Session) -> None:
         if s.broken:
+            logger.debug("connection discarded (it was marked broken); pool: %s", self._pool.stats())
             self._pool.discard(s.cache)   # also closes the connections
         else:
             self._pool.release(s.cache)
+            logger.debug("connection returned to the pool; pool: %s", self._pool.stats())
+
+    def _mark_broken(self, s: _Session, exc: BaseException, where: str) -> None:
+        if not s.broken:
+            logger.debug("connection marked broken (%s): %r", where, exc)
+        s.broken = True
 
     def _note_failure(self, s: _Session, exc: BaseException) -> None:
         if self.is_transient(exc):
-            s.broken = True
+            self._mark_broken(s, exc, "operation failed")
+
+    def pool_stats(self) -> Dict[str, int]:
+        """``{'total', 'idle', 'size'}`` of the connection pool (diagnostics)."""
+        return self._pool.stats()
 
     @contextmanager
     def session(self) -> Iterator[_Session]:
@@ -503,6 +514,28 @@ class SMBBackend(Backend):
     def listdir(self, loc: Location) -> List[str]:
         with self._conn(loc) as (unc, kw):
             return [n for n in self._smb.listdir(unc, **kw) if n not in (".", "..")]
+
+    def scandir(self, loc: Location) -> List[Entry]:
+        """One directory query returns names *and* sizes/times, so a big tree costs one round
+        trip per directory instead of one per file."""
+        if not hasattr(self._smb, "scandir"):
+            return super().scandir(loc)
+        out: List[Entry] = []
+        with self._conn(loc) as (unc, kw):
+            for e in self._smb.scandir(unc, **kw):
+                if e.name in (".", ".."):
+                    continue
+                try:
+                    st = e.stat()
+                    is_dir = stat_mod.S_ISDIR(st.st_mode)
+                    symlink = bool(e.is_symlink())
+                except Exception as exc:
+                    if self.is_transient(exc):
+                        raise
+                    continue                          # vanished while we listed
+                out.append(Entry(e.name, is_dir, st.st_size, st.st_mtime, symlink,
+                                 mtime_ns=getattr(st, "st_mtime_ns", None)))
+        return out
 
     def set_mtime(self, loc: Location, mtime: float) -> None:
         with self._conn(loc) as (unc, kw):

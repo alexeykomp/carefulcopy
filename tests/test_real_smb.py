@@ -14,8 +14,8 @@ import tempfile
 import unittest
 import uuid
 
-from carefulcopy import (CopyOptions, LockedError, Location, SMBBackend, StaticCredentials, copy_file,
-                         register_backend, reset_backends)
+from carefulcopy import (CopyOptions, LockedError, Location, SMBBackend, StaticCredentials, TreeOptions, copy_file,
+                         copy_tree, register_backend, reset_backends)
 
 import helpers  # noqa: F401
 
@@ -72,6 +72,40 @@ class RealServerTests(unittest.TestCase):
             self.assertEqual(f.read(), data)
         self.assertEqual(self.backend.listdir(self.base), ["a.bin"])        # no .part / .lock left
         print("\n  server mtime:", int(self.backend.stat(self.base / "a.bin").mtime), "(expected 1700000000)")
+
+    def test_tree_roundtrip_scandir_sizes_and_update_mode(self):
+        """Planning relies on smbclient.scandir() entries carrying real sizes/times, and 'update'
+        mode on the server keeping the mtime we set (within the 2 s tolerance)."""
+        files = {"a.bin": 1500, "sub/b.bin": 70_000, "sub/deep/c.bin": 3}
+        root = os.path.join(self.tmp.name, "tree")
+        for rel, size in files.items():
+            p = os.path.join(root, *rel.split("/"))
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(os.urandom(size))
+            os.utime(p, (1_700_000_000, 1_700_000_000))
+        os.makedirs(os.path.join(root, "empty"))
+        remote = str(self.base / "tree")
+        opts = CopyOptions(block_size=32 * 1024)
+        snaps = []
+        rep = copy_tree(root, remote, options=opts, tree=TreeOptions(workers=3), progress=snaps.append)
+        self.assertTrue(rep, rep.failures)
+        self.assertEqual(snaps[-1].bytes_copied, sum(files.values()))
+
+        listing = {e.name: e for e in self.backend.scandir(Location.parse(remote) / "sub")}
+        self.assertEqual(listing["b.bin"].size, 70_000, "scandir did not return the real file size")
+        self.assertTrue(listing["deep"].is_dir)
+
+        again = copy_tree(root, remote, options=opts, tree=TreeOptions(if_exists="update"))
+        print("\n  second run: copied", again.files_copied, "skipped", again.files_skipped,
+              "(expected 0 copied / 3 skipped; otherwise the server changes mtimes by more than 2 s)")
+        self.assertEqual(again.files_copied, 0)
+
+        back = os.path.join(self.tmp.name, "back")
+        self.assertTrue(copy_tree(remote, back, options=opts, tree=TreeOptions(workers=3)))
+        for rel, size in files.items():
+            self.assertEqual(os.path.getsize(os.path.join(back, *rel.split("/"))), size)
+        self.assertTrue(os.path.isdir(os.path.join(back, "empty")))
 
     def test_lock_excludes_a_second_writer(self):
         target = self.base / "locked.bin"

@@ -22,6 +22,19 @@ class FileInfo:
         return self.mtime_ns if self.mtime_ns is not None else int(round(self.mtime * 1_000_000_000))
 
 
+@dataclass(frozen=True)
+class Entry:
+    """One item of a directory listing, with the metadata needed to plan a copy."""
+
+    name: str
+    is_dir: bool
+    size: int = 0
+    mtime: float = 0.0
+    is_symlink: bool = False
+    is_other: bool = False        # neither a regular file nor a directory (socket, device, broken link...)
+    mtime_ns: Optional[int] = None
+
+
 class Backend(ABC):
     """Minimal filesystem-like interface used by the copy engine.
 
@@ -49,6 +62,22 @@ class Backend(ABC):
 
     @abstractmethod
     def set_mtime(self, loc: Location, mtime: float) -> None: ...
+
+    def scandir(self, loc: Location) -> List[Entry]:
+        """List a directory *with* size and mtime of every entry.
+
+        Backends should override this with something that needs one round trip per
+        directory. The default (``listdir`` + one ``stat`` each) works everywhere but is
+        slow over a network. Entries that vanish while listing are left out.
+        """
+        out: List[Entry] = []
+        for name in self.listdir(loc):
+            try:
+                info = self.stat(loc / name)
+            except FileNotFoundError:
+                continue
+            out.append(Entry(name, info.is_dir, info.size, info.mtime, mtime_ns=info.mtime_ns))
+        return out
 
     # -- data -------------------------------------------------------------
     @abstractmethod

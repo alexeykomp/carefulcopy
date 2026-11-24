@@ -1,4 +1,4 @@
-# carefulcopy
+# carefulcopy - the only copying engine you need
 
 Reliable file copying for flaky storage: **atomic**, **resumable**, with **retries**,
 **destination locks** and pluggable **backends** (local today, SMB next).
@@ -11,7 +11,7 @@ Reliable file copying for flaky storage: **atomic**, **resumable**, with **retri
 `shutil.copyfile` leaves a truncated file behind if the connection drops, and
 starts from zero on retry. carefulcopy:
 
-* writes to `<name>.part.<size>-<mtime>` and renames only when complete and verified;
+* writes to `<name>.part.<size>-<mtime_ns>-<hash of the source location>` and renames only when complete and verified;
 * **resumes** from the last byte written after a transient error (reset, timeout, ...);
 * detects a **source modified during the copy** and refuses to produce a mixed file;
 * takes an exclusive **lock** on the destination so two writers cannot collide, and
@@ -178,8 +178,47 @@ export CAREFULCOPY_TEST_SMB_USER=alice CAREFULCOPY_TEST_SMB_PASSWORD=secret
 cd tests && PYTHONPATH=../src python -m unittest test_real_smb -v
 ```
 
-Not ported from the original on purpose: Qt dialogs, the ping pre-check, the 15 s
-cool-down between credential prompts, and locking by truncating the destination.
+
+## Trees and batches
+
+```python
+from carefulcopy import copy_tree, copy_many, TreeOptions, CopyOptions, AdaptiveThrottle
+
+report = copy_tree(
+    "/data/photos", "smb://nas.local/Foto/backup/photos",     # dst is the copy itself (like shutil.copytree)
+    tree=TreeOptions(workers=4, if_exists="update", exclude=["*.tmp", ".DS_Store"]),
+    throttle=AdaptiveThrottle(),                                 # shared by all workers
+    progress=lambda p: print(f"{p.phase:9} {p.files_done}/{p.files_total} files, {p.fraction:.0%}"),
+)
+print(report.files_copied, "copied,", report.files_skipped, "skipped;", "OK" if report else "not complete")
+
+copy_many(["/a/one.iso", "/a/dir", "smb://nas.local/Foto/x.bin"], "/backup")   # each keeps its own name
+```
+
+* **Plan first.** The source is walked with one directory listing per directory (sizes and mtimes
+  included, so no per-file `stat` over SMB), giving exact totals. Progress is reported while scanning too.
+* **Aggregated progress.** One `TreeProgress` stream (`phase`, `bytes_copied/total`, `files_done/total`,
+  `fraction`, `current` = files in flight) from all workers. Callbacks are **serialised** (never
+  concurrent), rate-limited by `progress_interval` (the first and last always arrive) and run on a
+  worker thread when `workers > 1`. If your callback raises, the run stops and the error is re-raised.
+  Totals exclude skipped files. After a resume or restart of a file the byte count can step back, honestly.
+* **`workers=N`** copies N files at once with one throttle and one connection pool (keep N <= `pool_size`).
+  Worth it for many small files over a network; leave at 1 for a single big file.
+* **`if_exists`**: `overwrite` (default), `skip`, `error`, or `update` = skip when size and mtime match
+  (within `mtime_tolerance`, 2 s). **Re-running with `update` after an interruption copies only what is
+  missing or changed and resumes partial files** - big copies become restartable. (Needs
+  `preserve_mtime=True`, the default.)
+* **`errors`**: `"raise"` (default) stops at the first failed file and raises *its* error;
+  `"collect"` carries on and lists failures in the report. Authentication errors are always fatal.
+  A missing source or copying a directory into itself raises immediately.
+* **Report**: `CopyReport(files_copied, bytes_copied, skipped[(source, reason)], failures[(source, error)],
+  aborted)`; `bool(report)` is true when everything planned was copied. Aborting returns normally with
+  `aborted=True` and leaves only complete files.
+* **Filters**: `exclude` patterns (name, or relative path if it contains `/`); carefulcopy's own
+  leftovers (`*.part.*`, `x.lock` next to `x`) are skipped so a backup destination can be used as a source;
+  symlinks are skipped by default (`follow_symlinks=True`, **local sources only**, with loop detection);
+  special files (sockets, devices) are skipped; `max_depth` guards against runaway nesting.
+* Not preserved: directory mtimes, permissions/ACLs, hard links. Empty directories are created.
 
 ## Writing a backend
 
@@ -209,13 +248,13 @@ Override `is_transient(exc)` to tell the engine which errors mean
 1. ~~Engine, local backend, tests~~
 2. ~~Bandwidth throttling (adaptive + fixed rate)~~
 3. ~~SMB backend, connection pool, credential providers, batched retry prompt~~ (verify on a real server!)
-4. `copy_tree` / `copy_many` with aggregated progress
-5. Examples (Qt retry dialog, CLI), CI, license
+4. ~~`copy_tree` / `copy_many` with aggregated progress~~
+5. Examples (Qt retry dialog, CLI), CI, license (not chosen yet), publishing
 
 ## Development
 
 ```
-cd tests && PYTHONPATH=../src python -m unittest discover -v    # or: pytest   (167 tests, ~6 s)
+cd tests && PYTHONPATH=../src python -m unittest discover -v    # or: pytest   (229 tests, ~8 s)
 
 The suite has a 120 s watchdog (`faulthandler`) that dumps all stacks and exits if a
 test ever hangs. Throttle tests use a virtual clock, so they run in milliseconds.

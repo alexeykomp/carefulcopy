@@ -67,6 +67,8 @@ class FakeServer:
         # False = a silent drop: the server keeps the dead connection's handles until it notices
         # (call expire_zombies()). True = Samba-style cleanup on TCP reset.
         self.release_handles_on_drop = False
+        self.stat_calls = 0
+        self.scandir_calls = 0
         self.dead_calls = 0             # operations attempted on an already-dead connection
         self.latency = 0.0              # seconds per read/write call (makes parallel copies overlap)
         self.default_share = ""         # what share_access=None means; real smbclient's default is unverified
@@ -167,6 +169,7 @@ class FakeClient:
     def stat(self, path, connection_cache=None, **kw):
         host, share, rel = self._parse(path)
         with self.s.lock:
+            self.s.stat_calls += 1
             self._sess(connection_cache, host)
             self._check_share(host, share, path)
             key = (host, share) + rel
@@ -183,6 +186,22 @@ class FakeClient:
             self._sess(connection_cache, host)
             self._check_share(host, share, path)
             return self.s.names(host, share, "/".join(rel))
+
+    def scandir(self, path, connection_cache=None, **kw):
+        host, share, rel = self._parse(path)
+        with self.s.lock:
+            self._sess(connection_cache, host)
+            self._check_share(host, share, path)
+            self.s.scandir_calls += 1
+            out = []
+            for name in self.s.names(host, share, "/".join(rel)):
+                key = (host, share) + rel + (name,)
+                if key in self.s.dirs:
+                    out.append(_Entry(name, _Stat(0, stat_mod.S_IFDIR | 0o755, time.time())))
+                else:
+                    node = self.s.files[key]
+                    out.append(_Entry(name, _Stat(len(node.data), stat_mod.S_IFREG | 0o644, node.mtime)))
+            return iter(out)
 
     def utime(self, path, times=None, ns=None, connection_cache=None, **kw):
         host, share, rel = self._parse(path)
@@ -286,6 +305,20 @@ class FakeClient:
             if mode == "ab":
                 f.pos = len(node.data)
             return f
+
+
+class _Entry:
+    def __init__(self, name, st):
+        self.name, self._st = name, st
+
+    def stat(self, follow_symlinks=True):
+        return self._st
+
+    def is_dir(self):
+        return stat_mod.S_ISDIR(self._st.st_mode)
+
+    def is_symlink(self):
+        return False
 
 
 class _Stat:

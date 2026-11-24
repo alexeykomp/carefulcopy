@@ -9,7 +9,7 @@ from typing import BinaryIO, Iterator, List, Optional
 
 from ..errors import LockedError
 from ..location import Location
-from .base import Backend, FileInfo
+from .base import Backend, Entry, FileInfo
 
 if os.name == "nt":  # pragma: no cover - exercised on Windows only
     import msvcrt
@@ -53,6 +53,26 @@ class LocalBackend(Backend):
 
     def listdir(self, loc: Location) -> List[str]:
         return os.listdir(self._p(loc))
+
+    def scandir(self, loc: Location) -> List[Entry]:
+        out: List[Entry] = []
+        with os.scandir(self._p(loc)) as it:
+            for e in it:
+                try:
+                    symlink = e.is_symlink()
+                except OSError:
+                    symlink = False
+                try:
+                    st = e.stat()                     # follows symlinks
+                except OSError:
+                    if symlink:                       # broken link: report it, the caller decides
+                        out.append(Entry(e.name, False, is_symlink=True, is_other=True))
+                    continue                          # otherwise it vanished while we listed
+                is_dir = stat_mod.S_ISDIR(st.st_mode)
+                out.append(Entry(e.name, is_dir, st.st_size, st.st_mtime, symlink,
+                                 is_other=not (is_dir or stat_mod.S_ISREG(st.st_mode)),
+                                 mtime_ns=st.st_mtime_ns))
+        return out
 
     def set_mtime(self, loc: Location, mtime: float) -> None:
         os.utime(self._p(loc), (mtime, mtime))
